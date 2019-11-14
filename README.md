@@ -111,6 +111,7 @@ nps是一款轻量级、高性能、功能强大的**内网穿透**代理服务�
    * [获取用户真实ip](#获取用户真实ip)
    * [客户端地址显示](#客户端地址显示)
    * [客户端与服务端版本对比](#客户端与服务端版本对比)
+   * [Linux系统限制](#Linux系统限制)
 * [webAPI](#webAPI)
 * [贡献](#贡献)
 * [支持nps发展](#捐赠)
@@ -144,6 +145,7 @@ nps是一款轻量级、高性能、功能强大的**内网穿透**代理服务�
 ```shell
 ./npc -server=1.1.1.1:8284 -vkey=客户端的密钥
 ```
+**注意：运行服务端后，请确保能从客户端设备上正常访问配置文件中所配置的`bridge_port`端口，telnet，netcat这类的来检查**
 
 ### 域名解析
 
@@ -183,7 +185,7 @@ nps是一款轻量级、高性能、功能强大的**内网穿透**代理服务�
 
 **使用步骤**
 - 在刚才创建的客户端的隧道管理中添加一条udp隧道，填写监听的端口（53）、内网目标ip和目标端口（10.1.50.102:53），保存。
-- 修改需要使用的内网dns为127.0.0.1，则相当于使用10.1.50.202作为dns服务器
+- 修改需要使用的dns地址为1.1.1.1，则相当于使用10.1.50.102作为dns服务器
 
 ### socks5代理
 
@@ -196,6 +198,9 @@ nps是一款轻量级、高性能、功能强大的**内网穿透**代理服务�
 **使用步骤**
 - 在刚才创建的客户端隧道管理中添加一条socks5代理，填写监听的端口（8003），保存。
 - 在外网环境的本机配置socks5代理(例如使用proxifier进行全局代理)，ip为公网服务器ip（1.1.1.1），端口为填写的监听端口(8003)，即可畅享内网了
+
+**注意**
+经过socks5代理，当收到socks5数据包时socket已经是accept状态。表现是扫描端口全open，建立连接后短时间关闭。若想同内网表现一致，建议远程连接一台设备。
 
 ### http正向代理
 
@@ -375,7 +380,13 @@ server {
 ```
 (./nps|nps.exe) install
 ```
-安装成功后，对于linux，darwin，将会把配置文件和静态文件放置于/etc/nps/，并将可执行文件nps复制到/usr/bin/nps或者/usr/local/bin/nps，安装成功后可在任何位置执行
+安装成功后，对于linux，darwin，将会把配置文件和静态文件放置于/etc/nps/，并将可执行文件nps复制到/usr/bin/nps或者/usr/local/bin/nps，安装成功后可在任何位置执行，同时也会添加systemd配置。
+
+```
+sudo systemctl enable|disable|start|stop|restart|status nps
+```
+systemd，带有开机自启，自动重启配置，当进程结束后15秒会启动，日志输出至/var/log/nps/nps.log。
+建议采用此方式启动，能够捕获panic信息，便于排查问题。
 
 ```
 nps test|start|stop|restart|status
@@ -431,6 +442,27 @@ server_ip=xxx
 此模式使用nps的公钥或者客户端私钥验证，各种配置在客户端完成，同时服务端web也可以进行管理
 ```
  ./npc -config=npc配置文件路径
+```
+可自行添加systemd service，例如：`npc.service`
+```
+[Unit]
+Description=npc - convenient proxy server client
+Documentation=https://github.com/cnlh/nps/
+After=network-online.target remote-fs.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+KillMode=process
+Restart=always
+RestartSec=15s
+StandardOutput=append:/var/log/nps/npc.log
+ExecStartPre=/bin/echo 'Starting npc'
+ExecStopPost=/bin/echo 'Stopping npc'
+ExecStart=/absolutely path to/npc -server=ip:port -vkey=web界面中显示的密钥
+
+[Install]
+WantedBy=multi-user.target
 ```
 #### 配置文件说明
 [示例配置文件](https://github.com/cnlh/nps/tree/master/conf/npc.conf)
@@ -610,7 +642,7 @@ auto_reconnection=true
 ```
  ./npc nat
 ```
-如果p2p双方都是Symmetic Nat，肯定不能成功，其他组合都有较大成功率。
+如果p2p双方都是Symmetric Nat，肯定不能成功，其他组合都有较大成功率。
 #### 状态检查
 ```
  ./npc status -config=npc配置文件路径
@@ -899,6 +931,11 @@ LevelInformational->6 LevelDebug->7
 
 ### 客户端与服务端版本对比
 为了程序正常运行，客户端与服务端的核心版本必须一致，否则将导致客户端无法成功连接致服务端。
+
+### Linux系统限制
+默认情况下linux对连接数量有限制，对于性能好的机器完全可以调整内核参数以处理更多的连接。
+`tcp_max_syn_backlog` `somaxconn`
+酌情调整参数，增强网络性能
 
 ## webAPI
 
