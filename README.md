@@ -2,6 +2,7 @@
 # nps
 ![](https://img.shields.io/github/stars/cnlh/nps.svg)   ![](https://img.shields.io/github/forks/cnlh/nps.svg)
 [![Gitter](https://badges.gitter.im/cnlh-nps/community.svg)](https://gitter.im/cnlh-nps/community?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge)
+[![Build Status](https://travis-ci.org/cnlh/nps.svg?branch=master)](https://travis-ci.org/cnlh/nps)
 
 nps是一款轻量级、高性能、功能强大的**内网穿透**代理服务器。目前支持**tcp、udp流量转发**，可支持任何**tcp、udp**上层协议（访问内网网站、本地支付接口调试、ssh访问、远程桌面，内网dns解析等等……），此外还**支持内网http代理、内网socks5代理**、**p2p等**，并带有功能强大的web管理端。
 
@@ -26,6 +27,7 @@ nps是一款轻量级、高性能、功能强大的**内网穿透**代理服务�
 * [安装](#安装)
     * [编译安装](#源码安装)
     * [release安装](#release安装)
+    * [docker安装](#docker安装)
 * [使用示例（以web主控模式为主）](#使用示例)
     * [统一准备工作](#统一准备工作(必做))
     * [http|https域名解析](#域名解析)
@@ -46,6 +48,7 @@ nps是一款轻量级、高性能、功能强大的**内网穿透**代理服务�
     * [配置文件说明](#服务端配置文件)
     * [使用https](#使用https)
     * [与nginx配合](#与nginx配合)
+    * [web使用Caddy代理](#web使用Caddy代理)
     * [关闭http|https代理](#关闭代理)
     * [将nps安装到系统](#将nps安装到系统)
     * [流量数据持久化](#流量数据持久化)
@@ -121,7 +124,7 @@ nps是一款轻量级、高性能、功能强大的**内网穿透**代理服务�
 
 ## 安装
 
-### releases安装
+### release安装
 > [releases](https://github.com/cnlh/nps/releases)
 
 下载对应的系统版本即可，服务端和客户端是单独的
@@ -133,6 +136,10 @@ nps是一款轻量级、高性能、功能强大的**内网穿透**代理服务�
 > go build cmd/nps/nps.go
 
 > go build cmd/npc/npc.go
+
+### docker安装
+> [server](https://hub.docker.com/r/ffdfgdfg/nps)
+> [client](https://hub.docker.com/r/ffdfgdfg/npc)
 
 ## 使用示例
 
@@ -240,23 +247,22 @@ nps是一款轻量级、高性能、功能强大的**内网穿透**代理服务�
 **适用范围：**  大流量传输场景，流量不经过公网服务器，但是由于p2p穿透和nat类型关系较大，不保证100%成功，支持大部分nat类型。[nat类型检测](#nat类型检测)
 
 **假设场景：**
-内网1机器ip为10.1.50.2    内网2机器2 ip为10.2.50.2
 
-想通过访问内网1机器1的2000端口---->访问到内网2机器3 10.2.50.3的22端口
+想通过访问使用端机器（访问端，也就是本机）的2000端口---->访问到内网机器 10.2.50.2的22端口
 
 **使用步骤**
 - 在`nps.conf`中设置`p2p_ip`（nps服务器ip）和`p2p_port`（nps服务器udp端口）
 - 在刚才刚才创建的客户端中添加一条p2p代理，并设置唯一密钥p2pssh
-- 在机器1执行命令
+- 在使用端机器（本机）执行命令
 
 ```
-./npc -server=1.1.1.1:8284 -vkey=123 -password=p2pssh -target=10.2.50.3:22
+./npc -server=1.1.1.1:8284 -vkey=123 -password=p2pssh -target=10.2.50.2:22
 ```
 如需指定本地端口可加参数`-local_port=xx`，默认为2000
 
 **注意：** password为web管理上添加的唯一密钥，具体命令可查看web管理上的命令提示
 
-假设机器3用户名为root，现在在机器1上执行`ssh -p 2000 root@127.0.0.1`即可访问机器2的ssh
+假设内网机器为10.2.50.2的ssh用户名为root，现在在本机上执行`ssh -p 2000 root@127.0.0.1`即可访问机器2的ssh，如果是网站在浏览器访问127.0.0.1:2000端口即可。
 
 
 
@@ -312,6 +318,7 @@ nps是一款轻量级、高性能、功能强大的**内网穿透**代理服务�
 web_port | web管理端口
 web_password | web界面管理密码
 web_username | web界面管理账号
+web_base_url | web管理主路径,用于将web管理置于代理子路径后面
 bridge_port  | 服务端客户端通信端口
 https_proxy_port | 域名代理https代理监听端口
 http_proxy_port | 域名代理http代理监听端口
@@ -370,6 +377,29 @@ server {
     }
 }
 ```
+
+### web使用Caddy代理
+
+如果将web配置到Caddy代理,实现子路径访问nps,可以这样配置.
+
+假设我们想通过 `http://caddy_ip:caddy_port/nps` 来访问后台, Caddyfile 这样配置:
+
+```Caddyfile
+caddy_ip:caddy_port/nps {
+  #server_ip 为 nps 服务器IP
+  #web_port 为 nps 后台端口
+  proxy / http://server_ip:web_port/nps {
+	transparent
+  }
+}
+```
+
+nps.conf 修改 `web_base_url` 为 `/nps` 即可
+```
+web_base_url=/nps
+```
+
+
 ### 关闭代理
 
 如需关闭http代理可在配置文件中将http_proxy_port设置为空，如需关闭https代理可在配置文件中将https_proxy_port设置为空。
@@ -570,11 +600,13 @@ vkey=123
 [socks5]
 mode=socks5
 server_port=9004
+multi_account=multi_account.conf
 ```
 项 | 含义
 ---|---
 mode | socks5
 server_port | 在服务端的代理端口
+multi_account | socks5多账号配置文件（可选),配置后使用basic_username和basic_password无法通过认证
 ##### 私密代理模式
 
 ```ini
@@ -824,6 +856,19 @@ nps支持对客户端的隧道数量进行限制，该功能默认是关闭的�
 
 nps主要通信默认基于多路复用，无需开启。
 
+多路复用基于TCP滑动窗口原理设计，动态计算延迟以及带宽来算出应该往网络管道中打入的流量。
+由于主要通信大多采用TCP协议，并无法探测其实时丢包情况，对于产生丢包重传的情况，采用较大的宽容度，
+5分钟的等待时间，超时将会关闭当前隧道连接并重新建立，这将会抛弃当前所有的连接。
+在Linux上，可以通过调节内核参数来适应不同应用场景。
+
+对于需求大带宽又有一定的丢包的场景，可以保持默认参数不变，尽可能少抛弃连接
+高并发下可根据[Linux系统限制](#Linux系统限制) 调整
+
+对于延迟敏感而又有一定丢包的场景，可以适当调整TCP重传次数
+`tcp_syn_retries`, `tcp_retries1`, `tcp_retries2`
+高并发同上
+nps会在系统主动关闭连接的时候拿到报错，进而重新建立隧道连接
+
 ### 环境变量渲染
 npc支持环境变量渲染以适应在某些特殊场景下的要求。
 
@@ -994,6 +1039,13 @@ POST /auth/getauthkey
 
 ## 捐助
 如果您觉得nps对你有帮助，欢迎给予我们一定捐助，也是帮助nps更好的发展。
+## 致谢
+Thanks [jetbrains](https://www.jetbrains.com/?from=nps) for providing development tools for nps
+
+<html>
+<img src="https://ftp.bmp.ovh/imgs/2019/12/6435398b0c7402b1.png" width="300"  align=center />
+</html>
+
 
 ### 支付宝
 ![image](https://github.com/cnlh/nps/blob/master/image/donation_zfb.png?raw=true)

@@ -3,6 +3,7 @@ package mux
 import (
 	"errors"
 	"io"
+	"math"
 	"net"
 	"runtime"
 	"sync"
@@ -189,7 +190,7 @@ func (Self *ReceiveWindow) New(mux *Mux) {
 	// initial a window for receive
 	Self.bufQueue.New()
 	Self.element = common.ListElementPool.Get()
-	Self.maxSize = 4096
+	Self.maxSize = common.MAXIMUM_SEGMENT_SIZE * 10
 	Self.mux = mux
 	Self.window.New()
 }
@@ -208,20 +209,25 @@ func (Self *ReceiveWindow) calcSize() {
 	// calculating maximum receive window size
 	if Self.count == 0 {
 		//logs.Warn("ping, bw", Self.mux.latency, Self.bw.Get())
-		n := uint32(2 * Self.mux.latency * Self.mux.bw.Get() * 1.5 / float64(Self.mux.connMap.Size()))
-		if n < 8192 {
-			n = 8192
+		conns := Self.mux.connMap.Size()
+		n := uint32(math.Float64frombits(atomic.LoadUint64(&Self.mux.latency)) *
+			Self.mux.bw.Get() / float64(conns))
+		if n < common.MAXIMUM_SEGMENT_SIZE*10 {
+			n = common.MAXIMUM_SEGMENT_SIZE * 10
 		}
 		bufLen := Self.bufQueue.Len()
 		if n < bufLen {
 			n = bufLen
 		}
+		if n < Self.maxSize/2 {
+			n = Self.maxSize / 2
+		}
 		// set the minimal size
 		if n > 2*Self.maxSize {
 			n = 2 * Self.maxSize
 		}
-		if n > common.MAXIMUM_WINDOW_SIZE {
-			n = common.MAXIMUM_WINDOW_SIZE
+		if n > (common.MAXIMUM_WINDOW_SIZE / uint32(conns)) {
+			n = common.MAXIMUM_WINDOW_SIZE / uint32(conns)
 		}
 		// set the maximum size
 		//logs.Warn("n", n)
@@ -277,6 +283,9 @@ copyData:
 		// on the first Read method invoked, Self.off and Self.element.l
 		// both zero value
 		common.ListElementPool.Put(Self.element)
+		if Self.closeOp {
+			return 0, io.EOF
+		}
 		Self.element, err = Self.bufQueue.Pop()
 		// if the queue is empty, Pop method will wait until one element push
 		// into the queue successful, or timeout.
@@ -284,7 +293,8 @@ copyData:
 		// reset to 60s if timeout and data still available
 		Self.off = 0
 		if err != nil {
-			return // queue receive stop or time out, break the loop and return
+			Self.CloseWindow() // also close the window, to avoid read twice
+			return             // queue receive stop or time out, break the loop and return
 		}
 		//logs.Warn("pop element", Self.element.l, Self.element.part)
 	}
@@ -341,6 +351,26 @@ func (Self *ReceiveWindow) Stop() {
 func (Self *ReceiveWindow) CloseWindow() {
 	Self.window.CloseWindow()
 	Self.Stop()
+	Self.release()
+}
+
+func (Self *ReceiveWindow) release() {
+	//if Self.element != nil {
+	//	if Self.element.Buf != nil {
+	//		common.WindowBuff.Put(Self.element.Buf)
+	//	}
+	//	common.ListElementPool.Put(Self.element)
+	//}
+	for {
+		ele := Self.bufQueue.TryPop()
+		if ele == nil {
+			return
+		}
+		if ele.Buf != nil {
+			common.WindowBuff.Put(ele.Buf)
+		}
+		common.ListElementPool.Put(ele)
+	} // release resource
 }
 
 type SendWindow struct {
@@ -352,8 +382,8 @@ type SendWindow struct {
 
 func (Self *SendWindow) New(mux *Mux) {
 	Self.setSizeCh = make(chan struct{})
-	Self.maxSize = 4096
-	atomic.AddUint64(&Self.remainingWait, uint64(4096)<<dequeueBits)
+	Self.maxSize = common.MAXIMUM_SEGMENT_SIZE * 10
+	atomic.AddUint64(&Self.remainingWait, uint64(common.MAXIMUM_SEGMENT_SIZE*10)<<dequeueBits)
 	Self.mux = mux
 	Self.window.New()
 }
@@ -470,8 +500,16 @@ start:
 
 func (Self *SendWindow) waitReceiveWindow() (err error) {
 	t := Self.timeout.Sub(time.Now())
-	if t < 0 {
-		t = time.Minute
+	if t < 0 { // not set the timeout, wait for it as long as connection close
+		select {
+		case _, ok := <-Self.setSizeCh:
+			if !ok {
+				return errors.New("conn.writeWindow: window closed")
+			}
+			return nil
+		case <-Self.closeOpCh:
+			return errors.New("conn.writeWindow: window closed")
+		}
 	}
 	timer := time.NewTimer(t)
 	defer timer.Stop()

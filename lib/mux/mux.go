@@ -13,21 +13,22 @@ import (
 )
 
 type Mux struct {
+	latency uint64 // we store latency in bits, but it's float64
 	net.Listener
-	conn         net.Conn
-	connMap      *connMap
-	newConnCh    chan *conn
-	id           int32
-	closeChan    chan struct{}
-	IsClose      bool
-	pingOk       int
-	latency      float64
-	bw           *bandwidth
-	pingCh       chan []byte
-	pingCheck    bool
-	connType     string
-	writeQueue   PriorityQueue
-	newConnQueue ConnQueue
+	conn          net.Conn
+	connMap       *connMap
+	newConnCh     chan *conn
+	id            int32
+	closeChan     chan struct{}
+	IsClose       bool
+	pingOk        uint32
+	counter       *latencyCounter
+	bw            *bandwidth
+	pingCh        chan []byte
+	pingCheckTime uint32
+	connType      string
+	writeQueue    PriorityQueue
+	newConnQueue  ConnQueue
 }
 
 func NewMux(c net.Conn, connType string) *Mux {
@@ -43,6 +44,7 @@ func NewMux(c net.Conn, connType string) *Mux {
 		IsClose:   false,
 		connType:  connType,
 		pingCh:    make(chan []byte),
+		counter:   newLatencyCounter(),
 	}
 	m.writeQueue.New()
 	m.newConnQueue.New()
@@ -99,7 +101,7 @@ func (s *Mux) sendInfo(flag uint8, id int32, data ...interface{}) {
 	err = pack.NewPac(flag, id, data...)
 	if err != nil {
 		common.MuxPack.Put(pack)
-		logs.Error("mux: new pack err")
+		logs.Error("mux: new pack err", err)
 		s.Close()
 		return
 	}
@@ -113,31 +115,35 @@ func (s *Mux) writeSession() {
 }
 
 func (s *Mux) packBuf() {
-	buffer := common.BuffPool.Get()
+	//buffer := common.BuffPool.Get()
 	for {
 		if s.IsClose {
 			break
 		}
-		buffer.Reset()
+		//buffer.Reset()
 		pack := s.writeQueue.Pop()
+		if s.IsClose {
+			break
+		}
 		//buffer := common.BuffPool.Get()
-		err := pack.Pack(buffer)
+		err := pack.Pack(s.conn)
 		common.MuxPack.Put(pack)
 		if err != nil {
 			logs.Error("mux: pack err", err)
-			common.BuffPool.Put(buffer)
+			//common.BuffPool.Put(buffer)
+			s.Close()
 			break
 		}
 		//logs.Warn(buffer.String())
 		//s.bufQueue.Push(buffer)
-		l := buffer.Len()
-		n, err := buffer.WriteTo(s.conn)
+		//l := buffer.Len()
+		//n, err := buffer.WriteTo(s.conn)
 		//common.BuffPool.Put(buffer)
-		if err != nil || int(n) != l {
-			logs.Error("mux: close from write session fail ", err, n, l)
-			s.Close()
-			break
-		}
+		//if err != nil || int(n) != l {
+		//	logs.Error("mux: close from write session fail ", err, n, l)
+		//	s.Close()
+		//	break
+		//}
 	}
 }
 
@@ -167,31 +173,32 @@ func (s *Mux) ping() {
 		s.sendInfo(common.MUX_PING_FLAG, common.MUX_PING, now)
 		// send the ping flag and get the latency first
 		ticker := time.NewTicker(time.Second * 5)
+    defer ticker.Stop()
 		for {
 			if s.IsClose {
-				ticker.Stop()
 				break
 			}
 			select {
 			case <-ticker.C:
 			}
-			if s.pingCheck {
+			if atomic.LoadUint32(&s.pingCheckTime) >= 60 {
 				logs.Error("mux: ping time out")
 				s.Close()
-				// more than 5 seconds not receive the ping return package,
+				// more than 5 minutes not receive the ping return package,
 				// mux conn is damaged, maybe a packet drop, close it
 				break
 			}
 			now, _ := time.Now().UTC().MarshalText()
 			s.sendInfo(common.MUX_PING_FLAG, common.MUX_PING, now)
-			s.pingCheck = true
-			if s.pingOk > 10 && s.connType == "kcp" {
+			atomic.AddUint32(&s.pingCheckTime, 1)
+			if atomic.LoadUint32(&s.pingOk) > 10 && s.connType == "kcp" {
 				logs.Error("mux: kcp ping err")
 				s.Close()
 				break
 			}
-			s.pingOk++
+			atomic.AddUint32(&s.pingOk, 1)
 		}
+    return
 	}()
 }
 
@@ -205,17 +212,20 @@ func (s *Mux) pingReturn() {
 			}
 			select {
 			case data = <-s.pingCh:
-				s.pingCheck = false
+				atomic.StoreUint32(&s.pingCheckTime, 0)
 			case <-s.closeChan:
 				break
 			}
 			_ = now.UnmarshalText(data)
 			latency := time.Now().UTC().Sub(now).Seconds() / 2
-			if latency < 0.5 && latency > 0 {
-				s.latency = latency
+			if latency > 0 {
+				atomic.StoreUint64(&s.latency, math.Float64bits(s.counter.Latency(latency)))
+				// convert float64 to bits, store it atomic
 			}
-			//logs.Warn("latency", s.latency)
-			common.WindowBuff.Put(data)
+			//logs.Warn("latency", math.Float64frombits(atomic.LoadUint64(&s.latency)))
+			if cap(data) > 0 {
+				common.WindowBuff.Put(data)
+			}
 		}
 	}()
 }
@@ -224,7 +234,13 @@ func (s *Mux) readSession() {
 	go func() {
 		var connection *conn
 		for {
+			if s.IsClose {
+				break
+			}
 			connection = s.newConnQueue.Pop()
+			if s.IsClose {
+				break // make sure that is closed
+			}
 			s.connMap.Set(connection.connId, connection) //it has been set before send ok
 			s.newConnCh <- connection
 			s.sendInfo(common.MUX_NEW_CONN_OK, connection.connId, nil)
@@ -241,12 +257,12 @@ func (s *Mux) readSession() {
 			pack = common.MuxPack.Get()
 			s.bw.StartRead()
 			if l, err = pack.UnPack(s.conn); err != nil {
-				logs.Error("mux: read session unpack from connection err")
+				logs.Error("mux: read session unpack from connection err", err)
 				s.Close()
 				break
 			}
 			s.bw.SetCopySize(l)
-			s.pingOk = 0
+			atomic.StoreUint32(&s.pingOk, 0)
 			switch pack.Flag {
 			case common.MUX_NEW_CONN: //new connection
 				connection := NewConn(pack.Id, s)
@@ -267,7 +283,7 @@ func (s *Mux) readSession() {
 				case common.MUX_NEW_MSG, common.MUX_NEW_MSG_PART: //new msg from remote connection
 					err = s.newMsg(connection, pack)
 					if err != nil {
-						logs.Error("mux: read session connection new msg err")
+						logs.Error("mux: read session connection new msg err", err)
 						connection.Close()
 					}
 					continue
@@ -284,9 +300,9 @@ func (s *Mux) readSession() {
 					connection.sendWindow.SetSize(pack.Window, pack.ReadLength)
 					continue
 				case common.MUX_CONN_CLOSE: //close the connection
-					s.connMap.Delete(pack.Id)
-					//go func(connection *conn) {
 					connection.closeFlag = true
+					//s.connMap.Delete(pack.Id)
+					//go func(connection *conn) {
 					connection.receiveWindow.Stop() // close signal to receive window
 					//}(connection)
 					continue
@@ -319,17 +335,42 @@ func (s *Mux) newMsg(connection *conn, pack *common.MuxPackager) (err error) {
 	return
 }
 
-func (s *Mux) Close() error {
+func (s *Mux) Close() (err error) {
 	logs.Warn("close mux")
 	if s.IsClose {
 		return errors.New("the mux has closed")
 	}
 	s.IsClose = true
 	s.connMap.Close()
+	s.connMap = nil
 	//s.bufQueue.Stop()
 	s.closeChan <- struct{}{}
 	close(s.newConnCh)
-	return s.conn.Close()
+	err = s.conn.Close()
+	s.release()
+	return
+}
+
+func (s *Mux) release() {
+	for {
+		pack := s.writeQueue.TryPop()
+		if pack == nil {
+			break
+		}
+		if pack.BasePackager.Content != nil {
+			common.WindowBuff.Put(pack.BasePackager.Content)
+		}
+		common.MuxPack.Put(pack)
+	}
+	for {
+		connection := s.newConnQueue.TryPop()
+		if connection == nil {
+			break
+		}
+		connection = nil
+	}
+	s.writeQueue.Stop()
+	s.newConnQueue.Stop()
 }
 
 //get new connId as unique flag
@@ -346,36 +387,123 @@ func (s *Mux) getId() (id int32) {
 }
 
 type bandwidth struct {
+	readBandwidth uint64 // store in bits, but it's float64
 	readStart     time.Time
 	lastReadStart time.Time
-	bufLength     uint16
-	readBandwidth float64
+	bufLength     uint32
 }
 
 func (Self *bandwidth) StartRead() {
 	if Self.readStart.IsZero() {
 		Self.readStart = time.Now()
 	}
-	if Self.bufLength >= 16384 {
+	if Self.bufLength >= common.MAXIMUM_SEGMENT_SIZE*300 {
 		Self.lastReadStart, Self.readStart = Self.readStart, time.Now()
 		Self.calcBandWidth()
 	}
 }
 
 func (Self *bandwidth) SetCopySize(n uint16) {
-	Self.bufLength += n
+	Self.bufLength += uint32(n)
 }
 
 func (Self *bandwidth) calcBandWidth() {
 	t := Self.readStart.Sub(Self.lastReadStart)
-	Self.readBandwidth = float64(Self.bufLength) / t.Seconds()
+	atomic.StoreUint64(&Self.readBandwidth, math.Float64bits(float64(Self.bufLength)/t.Seconds()))
 	Self.bufLength = 0
 }
 
 func (Self *bandwidth) Get() (bw float64) {
 	// The zero value, 0 for numeric types
-	if Self.readBandwidth <= 0 {
-		Self.readBandwidth = 100
+	bw = math.Float64frombits(atomic.LoadUint64(&Self.readBandwidth))
+	if bw <= 0 {
+		bw = 100
 	}
-	return Self.readBandwidth
+	//logs.Warn(bw)
+	return
+}
+
+const counterBits = 4
+const counterMask = 1<<counterBits - 1
+
+func newLatencyCounter() *latencyCounter {
+	return &latencyCounter{
+		buf:     make([]float64, 1<<counterBits, 1<<counterBits),
+		headMin: 0,
+	}
+}
+
+type latencyCounter struct {
+	buf []float64 //buf is a fixed length ring buffer,
+	// if buffer is full, new value will replace the oldest one.
+	headMin uint8 //head indicate the head in ring buffer,
+	// in meaning, slot in list will be replaced;
+	// min indicate this slot value is minimal in list.
+}
+
+func (Self *latencyCounter) unpack(idxs uint8) (head, min uint8) {
+	head = uint8((idxs >> counterBits) & counterMask)
+	// we set head is 4 bits
+	min = uint8(idxs & counterMask)
+	return
+}
+
+func (Self *latencyCounter) pack(head, min uint8) uint8 {
+	return uint8(head<<counterBits) |
+		uint8(min&counterMask)
+}
+
+func (Self *latencyCounter) add(value float64) {
+	head, min := Self.unpack(Self.headMin)
+	Self.buf[head] = value
+	if head == min {
+		min = Self.minimal()
+		//if head equals min, means the min slot already be replaced,
+		// so we need to find another minimal value in the list,
+		// and change the min indicator
+	}
+	if Self.buf[min] > value {
+		min = head
+	}
+	head++
+	Self.headMin = Self.pack(head, min)
+}
+
+func (Self *latencyCounter) minimal() (min uint8) {
+	var val float64
+	var i uint8
+	for i = 0; i < counterMask; i++ {
+		if Self.buf[i] > 0 {
+			if val > Self.buf[i] {
+				val = Self.buf[i]
+				min = i
+			}
+		}
+	}
+	return
+}
+
+func (Self *latencyCounter) Latency(value float64) (latency float64) {
+	Self.add(value)
+	_, min := Self.unpack(Self.headMin)
+	latency = Self.buf[min] * Self.countSuccess()
+	return
+}
+
+const lossRatio = 1.6
+
+func (Self *latencyCounter) countSuccess() (successRate float64) {
+	var success, loss, i uint8
+	_, min := Self.unpack(Self.headMin)
+	for i = 0; i < counterMask; i++ {
+		if Self.buf[i] > lossRatio*Self.buf[min] && Self.buf[i] > 0 {
+			loss++
+		}
+		if Self.buf[i] <= lossRatio*Self.buf[min] && Self.buf[i] > 0 {
+			success++
+		}
+	}
+	// counting all the data in the ring buf, except zero
+	successRate = float64(success) / float64(loss+success)
+	return
 }
